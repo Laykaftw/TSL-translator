@@ -52,6 +52,7 @@ device_loaded = None
 transform_loaded = None
 
 def get_hands_detector():
+    """Initializes and returns the MediaPipe Hands detector instance."""
     global hands_detector_instance
     if hands_detector_instance is None:
         logger.info("Server: Initializing MediaPipe Hands...")
@@ -59,11 +60,10 @@ def get_hands_detector():
         hands_detector_instance = mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            min_detection_confidence=0.2,  # Lowered from 0.5 for better detection
-            min_tracking_confidence=0.2,   # Lowered from 0.4 for better tracking
-            model_complexity=0             # Use higher complexity model (0, 1)
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.5
         )
-        logger.info("Server: MediaPipe Hands detector initialized with improved settings.")
+        logger.info("Server: MediaPipe Hands detector initialized.")
     return hands_detector_instance
 
 def get_rotation_type():
@@ -329,6 +329,7 @@ async def predict_video(file: UploadFile = File(...)):
     min_segment_frames = max(config.SEQUENCE_LENGTH, 12)  # Ensure minimum frames
     stable_silence_count = 0
     current_segment = []
+    segment_end_buffer = 10  # Number of frames to trim from end of each segment
 
     for idx, frame in enumerate(all_frames):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -349,8 +350,11 @@ async def predict_video(file: UploadFile = File(...)):
                 stable_silence_count += 1
                 if stable_silence_count >= 8:  # End segment after 8 frames of low motion
                     if len(current_segment) >= min_segment_frames:
-                        motion_segments.append(current_segment)
-                        logger.info(f"Motion segment detected with {len(current_segment)} frames")
+                        # Trim the last few frames from the segment
+                        trimmed_segment = current_segment[:-segment_end_buffer] if len(current_segment) > segment_end_buffer else current_segment
+                        if len(trimmed_segment) >= min_segment_frames:
+                            motion_segments.append(trimmed_segment)
+                            logger.info(f"Motion segment detected with {len(trimmed_segment)} frames (trimmed {len(current_segment) - len(trimmed_segment)} frames from end)")
                     current_segment = []
                     stable_silence_count = 0
                 else:
@@ -359,8 +363,11 @@ async def predict_video(file: UploadFile = File(...)):
 
     # Don't forget the last segment
     if current_segment and len(current_segment) >= min_segment_frames:
-        motion_segments.append(current_segment)
-        logger.info(f"Final segment detected with {len(current_segment)} frames")
+        # Trim the last few frames from the final segment
+        trimmed_segment = current_segment[:-segment_end_buffer] if len(current_segment) > segment_end_buffer else current_segment
+        if len(trimmed_segment) >= min_segment_frames:
+            motion_segments.append(trimmed_segment)
+            logger.info(f"Final segment detected with {len(trimmed_segment)} frames (trimmed {len(current_segment) - len(trimmed_segment)} frames from end)")
 
     logger.info(f"Detected {len(motion_segments)} potential sign segments")
 
@@ -371,7 +378,10 @@ async def predict_video(file: UploadFile = File(...)):
         for i in range(0, len(all_frames), segment_size):
             segment = all_frames[i:i + segment_size]
             if len(segment) >= min_segment_frames:
-                motion_segments.append(segment)
+                # Trim the last few frames from each segment
+                trimmed_segment = segment[:-segment_end_buffer] if len(segment) > segment_end_buffer else segment
+                if len(trimmed_segment) >= min_segment_frames:
+                    motion_segments.append(trimmed_segment)
 
     # --- Predict Each Segment ---
     detected_signs = []
@@ -388,7 +398,9 @@ async def predict_video(file: UploadFile = File(...)):
             selected_frames = segment
         else:
             # Select frames more evenly distributed across the segment
-            indices = np.linspace(0, len(segment) - 1, config.SEQUENCE_LENGTH, dtype=int)
+            # Exclude the last few frames from selection to avoid hand-down movements
+            selection_length = len(segment) - min(segment_end_buffer, len(segment) // 4)
+            indices = np.linspace(0, selection_length - 1, config.SEQUENCE_LENGTH, dtype=int)
             selected_frames = [segment[i] for i in indices]
         
         processed_tensors = []
@@ -396,15 +408,19 @@ async def predict_video(file: UploadFile = File(...)):
 
         for frame_idx, bgr_frame in enumerate(selected_frames):
             try:
+                # Save the input frame
+                input_frame_path = os.path.join(segment_debug_dir, f"frame_{frame_idx:02d}_input.png")
+                cv2.imwrite(input_frame_path, bgr_frame)
+
                 image_rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
                 masked_gray, last_valid_mask_local, hands_detected = apply_mediapipe_mask_and_grayscale_internal(
                     image_rgb, last_valid_mask_local
                 )
 
                 if masked_gray is not None and np.any(masked_gray > 0):
-                    # Save debug frame
-                    debug_frame_path = os.path.join(segment_debug_dir, f"frame_{frame_idx:02d}_masked.png")
-                    cv2.imwrite(debug_frame_path, masked_gray)
+                    # Save masked frame
+                    masked_frame_path = os.path.join(segment_debug_dir, f"frame_{frame_idx:02d}_masked.png")
+                    cv2.imwrite(masked_frame_path, masked_gray)
 
                     tensor = transform_loaded(masked_gray)
                     processed_tensors.append(tensor)
@@ -441,6 +457,7 @@ async def predict_video(file: UploadFile = File(...)):
             f.write(f"Predicted Class: {predicted_class}\n")
             f.write(f"Confidence Score: {confidence_val:.4f}\n")
             f.write(f"Total Frames in Segment: {len(segment)}\n")
+            f.write(f"Frames Trimmed from End: {segment_end_buffer}\n")
             f.write(f"Selected Frames: {len(selected_frames)}\n")
             f.write(f"Processed Tensors: {len(processed_tensors)}\n")
             f.write(f"Input Tensor Shape: {input_tensor.shape}\n")
