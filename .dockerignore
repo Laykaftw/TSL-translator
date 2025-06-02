@@ -1,3 +1,7 @@
+# Git
+.git/
+.gitignore
+
 # Python
 __pycache__/
 *.py[cod]
@@ -60,3 +64,13 @@ saved_models/*.pth
 # System
 .DS_Store
 Thumbs.db
+
+# Other
+.qodo/
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Deployment files
+app.yaml 
